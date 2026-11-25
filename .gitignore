@@ -1,0 +1,4 @@
+host/www/
+host/.upstream/
+__pycache__/
+*.pyc
