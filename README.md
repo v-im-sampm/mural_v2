@@ -1,149 +1,151 @@
-# Mural v2 on an Arduino Uno + CNC Shield
+# Mural v2 on an ESP32 "Uno" board + Arduino CNC Shield
 
-This runs a [Mural v2](https://getmural.me) wall-drawing robot with an **Arduino Uno + CNC Shield V3**
-instead of the ESP32 "TMC2209 Pen/Laser FluidNC" controller from the official BOM.
+This runs the **official [Mural v2](https://getmural.me) firmware** on an ESP32 board in Arduino Uno form factor
+(Wemos **D1 R32** and its clones) with an **Arduino CNC Shield V3**, instead of the
+"TMC2209 Pen/Laser FluidNC" controller from the Mural BOM.
 
-## Why this needs a PC
+The CNC Shield is wired differently from the official controller, so the firmware needs a small patch
+([`patches/mural-d1r32.patch`](patches/mural-d1r32.patch)):
 
-Stock Mural firmware runs entirely on an ESP32. That chip hosts the WiFi web UI,
-stores the drawing on an SD card, does the kinematics, and drives the motors. An Uno
-has no WiFi and only 2 KB of RAM, so it can't run that firmware. This project splits
-the job in two:
+- **Pins** remapped to the CNC Shield. All pin numbers live in one new file, `src/board.h`.
+- **Driver UART setup disabled.** The stock board sets the TMC2209 current and microstepping over a serial line the
+  shield doesn't have. On the shield you set them with jumpers and the driver's potentiometer.
+  The UART pins (GPIO16/17) are also X-DIR and Z-STEP on the shield, so leaving that code in would break the X motor.
+- **OLED made optional.** Stock firmware crashes without it. The IP address is now also printed on the USB serial port.
 
-```
- Browser (Mural UI) ──HTTP──▶ host/mural_bridge.py on your PC ──USB cable──▶ Uno + CNC Shield ──▶ motors, servo
-                               • serves the stock Mural UI                     • firmware/mural_uno
-                               • Mural's kinematic model (exact port)          • coordinated stepping
-                               • setup phases, drawing runner                  • pen servo
-```
-
-You get the **same UI and the same setup flow** as stock Mural, and the same motion math.
-The trade-off is that **the robot stays tethered to a computer by a USB cable** while it draws.
-
-> If you'd rather have stock Mural (wireless, standalone, official support), the ESP32
-> FluidNC pen/laser board is the only missing part and costs about $20–30. Everything else
-> you already have carries over.
+Everything else is unchanged: the same WiFi web UI, setup screens, kinematics, and drawing pipeline.
 
 ---
 
-## 1. Extra parts
+## 1. Check your board
+
+Look at the silkscreen next to the Uno headers. On a D1 R32 the pin labels include the ESP32 GPIO number,
+for example **D2 → IO26, D3 → IO25, D8 → IO12, D9 → IO13**. The full mapping this patch assumes is:
+
+| Uno pin | D2 | D3 | D4 | D5 | D6 | D7 | D8 | D9 | D10 | D11 | D12 | D13 |
+|---|---|---|---|---|---|---|---|---|---|---|---|---|
+| **GPIO** | 26 | 25 | 17 | 16 | 27 | 14 | 12 | 13 | 5 | 23 | 19 | 18 |
+
+If your board's numbers differ, edit `src/board.h` in the prepared firmware (step 5).
+
+## 2. Extra parts
 
 On top of the [Mural v2 BOM](https://github.com/nikivanov/mural/blob/main/BOM.md):
 
-| Part | Notes |
+| Part | Why |
 |---|---|
-| Arduino Uno (R3 or compatible) | |
-| CNC Shield V3 | the common red/blue "grbl" shield |
-| 2 × stepper driver modules | A4988, DRV8825, or TMC2209 (standalone/step-dir). TMC2209 runs quietest, closest to stock Mural |
-| 5 V buck converter (e.g. Mini-360 or LM2596 module) | powers the servo from the 12 V supply |
-| USB-A to USB-B cable (≤ 5 m) | PC to Uno. Use an *active* USB extension if you need more length |
+| 2 × stepper driver modules | **DRV8825** (recommended: guaranteed to accept the ESP32's 3.3 V signals), TMC2209 standalone (quietest), or A4988 |
+| Micro-SD card **module** (SPI breakout, 5 V type with regulator) | The FluidNC board has an SD slot built in; the shield doesn't. **The firmware won't run without a card.** |
+| 5 V buck converter (Mini-360, LM2596…), set to 5.0 V | Powers the servo and SD module from 12 V |
+| DC barrel plug (5.5 × 2.1 mm) with leads | Powers the ESP32 board from the PD trigger |
+| Female-to-female and male-to-female Dupont wires | |
 
-**Not used:** the 0.91" OLED, the micro-SD card, and the Dupont wires for the FluidNC board.
-**Still used:** both pancake steppers, the pulleys, belt, MG90S servo, USB-C PD trigger, 100 W USB-C supply, and the 10 ft USB-C cable (power only now).
+## 3. Wiring
 
-## 2. Wiring
+**Power** (USB-C PD trigger **set to 12 V**):
 
 | From | To |
 |---|---|
-| USB-C PD trigger, **set to 12 V** | CNC Shield blue screw terminal (+ / −). **Check the polarity: reversing it kills the drivers.** |
-| PD trigger 12 V | 5 V buck converter input. **Set the buck output to 5.0 V with a multimeter before connecting the servo.** |
-| Left belt motor | **X** motor header |
-| Right belt motor | **Y** motor header |
-| Servo signal (orange) | **Z+ / Z− end-stop** header, signal pin (= Arduino **D11**) |
-| Servo + (red) | buck converter 5 V out |
-| Servo − (brown) | buck converter GND **and** CNC Shield GND (common ground is required) |
-| Uno USB-B | your PC |
+| PD trigger 12 V | CNC Shield blue screw terminal. **Check polarity: reversed power kills the drivers.** |
+| PD trigger 12 V | ESP32 board's **DC barrel jack** (accepts 7–12 V). This powers the ESP32 and the shield's 5 V logic. |
+| PD trigger 12 V | 5 V buck converter input. **Set the buck to 5.0 V with a multimeter before connecting anything to it.** |
+| Buck GND | CNC Shield GND (screw terminal −). A common ground is required. |
 
-The Uno gets its power from USB. Don't run the servo from the Uno's 5 V pin: servo current spikes can reset the board in the middle of a drawing.
+**Signals:**
 
-## 3. Driver setup (on the bench, before hanging it up)
+| Mural part | Where on the CNC Shield | GPIO |
+|---|---|---|
+| Left belt motor | **X** motor header | 26 / 16 |
+| Right belt motor | **Y** motor header | 25 / 27 |
+| Servo signal (orange) | **X+ or X−** end-stop header, signal pin (D9) | 13 |
+| Servo red / brown | buck 5 V / GND | |
+| SD module **CS** | **Y+ or Y−** end-stop header, signal pin (D10) | 5 |
+| SD module **MOSI** | **Z+ or Z−** end-stop header, signal pin (D11) | 23 |
+| SD module **MISO** | **SpnEn** pin (D12) | 19 |
+| SD module **SCK** | **SpnDir** pin (D13) | 18 |
+| SD module VCC / GND | buck 5 V / GND | |
+| OLED SDA *(optional)* | **STEP** hole of the empty **Z driver socket** (D4) | 17 |
+| OLED SCL *(optional)* | **DIR** hole of the empty **Z driver socket** (D7) | 14 |
+| OLED VCC / GND *(optional)* | 3.3 V (the D1 R32's 3V3 pin) / GND | |
 
-Every move in Mural assumes **1/8 microstepping** (1600 steps/rev). Set the jumpers under each driver:
+Notes:
+- Each end-stop header is a pair of pins: one is the signal, the other is GND. "+" and "−" share the same signal line.
+- **Leave the Z driver socket empty**: its STEP and DIR pins are borrowed for the OLED.
+- Without the OLED, find Mural at **http://mural.local**, or read the IP address from the serial monitor (115200 baud).
+- The ESP32 is not 5 V-tolerant. Power the OLED from 3.3 V.
+  If you can only reach 5 V, check that the module's I²C pull-ups go to its own 3.3 V regulator, or skip the OLED.
 
-| Driver | Jumpers under the driver (M0 M1 M2) |
+## 4. Driver setup (on the bench)
+
+Mural assumes **1/8 microstepping**. Set the jumpers under each driver:
+
+| Driver | Jumpers (M0 M1 M2) |
 |---|---|
-| A4988 | **M0 + M1 on**, M2 off |
 | DRV8825 | **M0 + M1 on**, M2 off |
-| TMC2209 standalone | **no jumpers** (MS1 = MS2 = low → 1/8 on most modules; check yours) |
+| A4988 | **M0 + M1 on**, M2 off |
+| TMC2209 standalone | **none** (= 1/8 on most modules; check your module's table) |
 
-If you use a different setting, start the bridge with `--microsteps N` to match.
+**Current.** The pancake motors are 1 A parts; stock Mural runs them at about 0.7 A RMS. With motors unplugged and
+12 V on, measure between the driver's potentiometer and GND, then adjust:
 
-**Current limit.** The pancake motors are 1 A parts; aim for about 0.7–0.8 A. Adjust the potentiometer on each driver while measuring between the pot and GND, with motors unplugged and 12 V applied:
-
-- **A4988:** Vref = I × 8 × R<sub>sense</sub>. With R100 (0.1 Ω) sense resistors, use **≈ 0.6 V**. With R050 resistors, use ≈ 0.3 V.
-- **DRV8825:** Vref = I ÷ 2 → **≈ 0.4 V**.
-- **TMC2209:** follow the module's datasheet (often around **1.0 V** for 0.7 A RMS).
+- **DRV8825:** Vref = I ÷ 2 → **≈ 0.4 V**
+- **A4988:** Vref = I × 8 × R<sub>sense</sub> → **≈ 0.6 V** with R100 resistors (≈ 0.3 V with R050)
+- **TMC2209:** per the module's datasheet (often **≈ 1.0 V**)
 
 Other checks:
-- Plug each driver in with its **EN pin next to the shield's EN label**. A driver plugged in backwards is destroyed at power-on.
+- Seat each driver with its **EN pin next to the shield's EN label**. A driver plugged in backwards is destroyed at power-on.
 - Never plug or unplug a motor while 12 V is on.
-- If a motor buzzes but doesn't turn, one of its coil pairs is wired wrong. Check the pairs with a multimeter: a coil pair shows a few Ω between its two wires.
 
-## 4. Flash the Uno
+## 5. Build and flash the firmware
 
-1. Open `firmware/mural_uno/mural_uno.ino` in the Arduino IDE (it uses only the built-in Servo library).
-2. Board: **Arduino Uno**. Select the port and click **Upload**.
-3. Open the Serial Monitor at **115200** baud, line ending "Newline". You should see `MuralUno 1.0 ready`. Typing `V` should answer `ok`.
-
-Pin choices and motor direction are set in `firmware/mural_uno/config.h`.
-
-## 5. Set up the PC bridge
-
-You need Python 3.9+, git, and Node.js 18+ (Node is used once, to build the UI).
+You need [PlatformIO](https://platformio.org/install) (the VS Code extension or `pip install platformio`),
+[Node.js 18+](https://nodejs.org), and git.
 
 ```bash
-pip install -r host/requirements.txt
-python3 scripts/build_ui.py          # downloads upstream Mural and builds its web UI into host/www
+python3 scripts/prepare_firmware.py   # downloads Mural at a pinned commit, applies the patch, installs UI deps
+cd mural-firmware
 ```
 
-Run it (close the Arduino Serial Monitor first, because only one program can hold the port):
+Connect the ESP32 board to your PC by USB (12 V can stay off for this), then:
 
 ```bash
-python3 host/mural_bridge.py --port /dev/ttyACM0       # Linux
-python3 host/mural_bridge.py --port /dev/cu.usbmodem1101   # macOS
-python3 host/mural_bridge.py --port COM3               # Windows
+pio run -e d1r32 -t upload      # firmware
+pio run -e d1r32 -t uploadfs    # web UI (built automatically from ui/ and worker/)
+pio device monitor -b 115200    # optional: watch it boot
 ```
 
-Then open **http://localhost:8080**. To control it from your phone, add `--listen 0.0.0.0` and browse to `http://<pc-ip>:8080`.
+**First boot:** Mural opens a WiFi hotspot named **"Mural"**. Join it, pick your home WiFi in the page that opens,
+and Mural restarts. Then browse to **http://mural.local** (or the IP shown on the OLED or serial monitor).
+From here on, follow the [official Mural guide](https://getmural.me).
 
-To try the UI without any hardware: `python3 host/mural_bridge.py --simulate`.
+**First-time direction check:** on the *Retract belts* screen, "retract" must **wind the belt in**.
+If a side runs the wrong way, flip `BOARD_INVERT_LEFT` / `BOARD_INVERT_RIGHT` in
+`mural-firmware/src/board.h` and upload again. Swapping one coil pair of that motor's cable also works.
 
-## 6. Drawing
+## 6. Differences from stock Mural to watch for
 
-The screens are the same as in the [official Mural guide](https://getmural.me):
+- **Weight.** Mural's kinematics assume the robot weighs **0.55 kg** (`mass_bot` in `src/movement.h`).
+  The Uno-size board, shield and SD module change that. Weigh your finished robot and update the value.
+- **Mounting.** The v2 STLs have a mount for the FluidNC board, not for a 68.6 × 53.4 mm Uno-format board.
+  You'll need an adapter. Keep the weight centred between the pulleys.
+- **Noise.** DRV8825 and A4988 drivers are louder than TMC2209s.
 
-1. **Set top distance:** enter the pin-to-pin distance in mm.
-2. **Choose an image:** SVG or raster. It's converted in your browser and uploaded to the bridge.
-3. **Retract belts:** hold the retract buttons until each belt is pulled all the way in against its stop screw.
-   **First-time direction check:** "retract" must *wind the belt in*. If a side runs the wrong way,
-   flip `INVERT_LEFT_DIR` / `INVERT_RIGHT_DIR` in `config.h` and re-upload.
-4. **Extend to home:** hang Mural on the pins. It lowers itself to the home position.
-5. **Pen calibration:** find the servo angle where the marker just touches the wall.
-6. **Begin drawing.** Watch progress in the bridge's terminal.
+## Troubleshooting
 
-**Stopping:** press **Ctrl+C** in the bridge terminal. That stops the motors immediately and lifts the pen.
-You can also run `curl -X POST http://localhost:8080/stop`.
-After a stop, the robot's position is no longer known, so redo the setup screens.
+| Symptom | Likely cause / fix |
+|---|---|
+| Board boot-loops or reports `flash read err` **only with the shield attached** | GPIO12 (D8, the shield's EN line) is an ESP32 boot-strapping pin. If the shield pulls it high at reset, the flash gets the wrong voltage. Last-resort permanent fix: `espefuse.py --port <port> set_flash_voltage 3.3V` (safe for ESP32-WROOM-32 modules, irreversible). |
+| OLED shows **"NO CARD"** or serial says no card, then hangs | SD module wiring (CS/MOSI/MISO/SCK above) or power. Use a 5 V module powered from the buck. The card is formatted automatically if needed. |
+| Motor buzzes but doesn't turn | A coil pair is swapped in the motor cable, or the current is too low |
+| Motors stutter or skip at random with A4988/TMC2209 | Those drivers expect ~3.5 V logic when the shield runs them at 5 V, and the ESP32 only gives 3.3 V. Use DRV8825s. |
+| Can't reach http://mural.local | Use the IP address from the OLED or serial monitor (Android and some Windows setups don't resolve `.local`) |
 
-**Calibration:** the UI's tools menu has Mural's belt-length (e-steps) calibration. The pulley diameter it produces is saved in `~/.mural-uno/settings.json`.
-
-## 7. Things that differ from stock Mural
-
-- **Weight.** Mural's kinematics assume a **0.55 kg** robot. The Uno and shield weigh more and may also hang in a different spot.
-  Weigh your finished robot and set `MASS_BOT` in `host/kinematics.py` to match. It affects how the model compensates for tilt and belt stretch.
-- **Mounting.** The v2 STLs have a mount for the FluidNC board, not for an Uno (68.6 × 53.4 mm, holes on the standard Uno pattern).
-  You'll need an adapter plate. Keep the weight centred between the pulleys.
-- **No OLED or SD card.** Status appears in the bridge terminal, and the drawing file is stored on the PC in `~/.mural-uno/commands`.
-- **Noise.** A4988 and DRV8825 drivers are noticeably louder than the TMC2209 drivers on the stock board.
-
-## Files
+## What's in this repo
 
 | Path | What it is |
 |---|---|
-| `firmware/mural_uno/` | Uno sketch: serial protocol, coordinated stepping on Timer2, servo. The protocol is documented at the top of the `.ino` |
-| `host/mural_bridge.py` | PC bridge: HTTP API compatible with Mural's UI, setup phases, drawing runner, simulation mode |
-| `host/kinematics.py` | Port of Mural's kinematic model (`Movement::getBeltLengths`) |
-| `scripts/build_ui.py` | Fetches and builds the upstream UI at a pinned commit |
+| `patches/mural-d1r32.patch` | The firmware changes, against upstream commit `1eceffa` |
+| `scripts/prepare_firmware.py` | Clones upstream Mural, applies the patch, installs the UI's npm dependencies |
 
 Credits: Mural by Nik Ivanov and contributors, [github.com/nikivanov/mural](https://github.com/nikivanov/mural),
-licensed CC BY-NC 4.0. `host/kinematics.py` and the bridge's phase logic are adapted from it and carry the same non-commercial terms.
+licensed CC BY-NC 4.0. The patch is a derivative work under the same non-commercial terms.

@@ -1,0 +1,242 @@
+diff --git a/platformio.ini b/platformio.ini
+index 47aa8c6..b3091c4 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -25,3 +25,9 @@ lib_deps =
+ 	https://github.com/teemuatlut/tmcstepper.git@0.7.3+sha.74e8e68
+ 	waspinator/AccelStepper@^1.64
+ 	bblanchon/ArduinoJson@^5.13.4
++
++; ESP32 "Arduino Uno" board (Wemos D1 R32 and clones) + Arduino CNC Shield V3.
++; Pin map: src/board.h. Build/flash: pio run -e d1r32 -t upload && pio run -e d1r32 -t uploadfs
++[env:d1r32]
++extends = env:esp32dev
++build_flags = -DMURAL_BOARD_D1_R32
+diff --git a/src/board.h b/src/board.h
+new file mode 100644
+index 0000000..9c640bb
+--- /dev/null
++++ b/src/board.h
+@@ -0,0 +1,38 @@
++#ifndef Board_h
++#define Board_h
++
++// Pin map for the board Mural runs on. Select with a build flag in platformio.ini.
++
++#if defined(MURAL_BOARD_D1_R32)
++// ESP32 "Arduino Uno" board (Wemos D1 R32 and clones) + CNC Shield V3.
++// Uno header -> ESP32 GPIO on the D1 R32:
++//   D2=26 D3=25 D4=17 D5=16 D6=27 D7=14 D8=12 D9=13 D10=5 D11=23 D12=19 D13=18
++constexpr int BOARD_LEFT_STEP_PIN = 26;   // X.STEP (D2)
++constexpr int BOARD_LEFT_DIR_PIN = 16;    // X.DIR  (D5)
++constexpr int BOARD_RIGHT_STEP_PIN = 25;  // Y.STEP (D3)
++constexpr int BOARD_RIGHT_DIR_PIN = 27;   // Y.DIR  (D6)
++constexpr int BOARD_MOTOR_ENABLE_PIN = 12; // EN    (D8)
++constexpr bool BOARD_HAS_TMC_UART = false; // the shield doesn't wire driver UART; use jumpers + Vref
++constexpr bool BOARD_INVERT_LEFT = true;   // flip if "retract" unwinds the belt
++constexpr bool BOARD_INVERT_RIGHT = false;
++constexpr int BOARD_SERVO_PIN = 13;        // X+/X- end-stop header (D9)
++constexpr int BOARD_OLED_SDA = 17;         // Z driver socket STEP pin (D4) - leave the Z socket empty
++constexpr int BOARD_OLED_SCL = 14;         // Z driver socket DIR pin (D7)
++// SD card (SPI) uses the stock pins, which land on the shield's headers:
++//   CS=5 (Y end-stop, D10), MOSI=23 (Z end-stop, D11), MISO=19 (SpnEn, D12), SCK=18 (SpnDir, D13)
++#else
++// Stock Mural v2: TMC2209 Pen/Laser FluidNC controller.
++constexpr int BOARD_LEFT_STEP_PIN = 14;
++constexpr int BOARD_LEFT_DIR_PIN = 12;
++constexpr int BOARD_RIGHT_STEP_PIN = 25;
++constexpr int BOARD_RIGHT_DIR_PIN = 26;
++constexpr int BOARD_MOTOR_ENABLE_PIN = 13;
++constexpr bool BOARD_HAS_TMC_UART = true;
++constexpr bool BOARD_INVERT_LEFT = true;
++constexpr bool BOARD_INVERT_RIGHT = false;
++constexpr int BOARD_SERVO_PIN = 21;
++constexpr int BOARD_OLED_SDA = 15;
++constexpr int BOARD_OLED_SCL = 4;
++#endif
++
++#endif
+diff --git a/src/display.cpp b/src/display.cpp
+index 80e3985..5c0a6e2 100644
+--- a/src/display.cpp
++++ b/src/display.cpp
+@@ -1,4 +1,5 @@
+ #include "display.h"
++#include "board.h"
+ #include <Adafruit_SSD1306.h>
+ 
+ #define SCREEN_WIDTH 128
+@@ -6,12 +7,15 @@
+ #define TEXT_HEIGHT 8
+ 
+ Display::Display() {
+-    auto i2c_valid = Wire.begin(15, 4);
+-    Serial.printf("I2C changed OK to pins 15 and 4: %d\n", i2c_valid);
++    auto i2c_valid = Wire.begin(BOARD_OLED_SDA, BOARD_OLED_SCL);
++    Serial.printf("I2C on pins %d and %d: %d\n", BOARD_OLED_SDA, BOARD_OLED_SCL, i2c_valid);
+     display = new Adafruit_SSD1306(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, -1);
+     if (!display->begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+-        Serial.println(F("SSD1306 allocation failed"));
+-        throw std::invalid_argument("not ready");
++        // The display is optional: run without it (the IP address is also printed to Serial).
++        Serial.println(F("SSD1306 display not found, continuing without it"));
++        delete display;
++        display = nullptr;
++        return;
+     }
+     display->setRotation(0);
+     display->clearDisplay();
+@@ -21,6 +25,7 @@ Display::Display() {
+ }
+ 
+ void Display::drawLines(String lines[], int n) {
++    if (!display) return;
+     display->clearDisplay();
+     int16_t x1, y1;
+     uint16_t w, h;
+@@ -82,6 +87,7 @@ void Display::showFormatting() {
+ }
+ 
+ void Display::showDrawing(int progress) {
++    if (!display) return;
+    display->clearDisplay();
+ 
+     const int x = 8;
+diff --git a/src/main.cpp b/src/main.cpp
+index 5c062a9..f5f2245 100644
+--- a/src/main.cpp
++++ b/src/main.cpp
+@@ -113,6 +113,7 @@ void setup()
+         ipAddress = WiFi.localIP().toString();
+     }
+ 
++    Serial.println("Mural UI: http://" + ipAddress + "  (or http://mural.local)");
+     MDNS.begin("mural");
+ 
+     Serial.println("Started mDNS for mural");
+diff --git a/src/movement.cpp b/src/movement.cpp
+index 4773d74..33608ed 100644
+--- a/src/movement.cpp
++++ b/src/movement.cpp
+@@ -11,27 +11,32 @@ Movement::Movement(Display *display)
+ {
+     this->display = display;
+ 
+-    tmcSerial = new HardwareSerial(1);
+-    tmcSerial->begin(115200, SERIAL_8N1, 16, 17);
+-    delay(100); // Allow TMC2209 drivers to power-on and UART to settle
+-
+-    leftDriver = new TMC2209Stepper(tmcSerial, 0.11, LEFT_UART_ADDR);
+-    leftDriver->begin();
+-    leftDriver->toff(5);
+-    leftDriver->rms_current(707);
+-    leftDriver->microsteps(8);
+-    leftDriver->pwm_autoscale(true);
+-    Serial.printf("Left driver: conn=%d microsteps=%d rms: %d \n",
+-                  leftDriver->test_connection(), leftDriver->microsteps(), leftDriver->rms_current());
+-
+-    rightDriver = new TMC2209Stepper(tmcSerial, 0.11, RIGHT_UART_ADDR);
+-    rightDriver->begin();
+-    rightDriver->toff(5);
+-    rightDriver->rms_current(707);
+-    rightDriver->microsteps(8);
+-    rightDriver->pwm_autoscale(true);
+-    Serial.printf("Right driver: conn=%d microsteps=%d rms: %d \n",
+-                  rightDriver->test_connection(), rightDriver->microsteps(), rightDriver->rms_current());
++    if (BOARD_HAS_TMC_UART) {
++        tmcSerial = new HardwareSerial(1);
++        tmcSerial->begin(115200, SERIAL_8N1, 16, 17);
++        delay(100); // Allow TMC2209 drivers to power-on and UART to settle
++
++        leftDriver = new TMC2209Stepper(tmcSerial, 0.11, LEFT_UART_ADDR);
++        leftDriver->begin();
++        leftDriver->toff(5);
++        leftDriver->rms_current(707);
++        leftDriver->microsteps(8);
++        leftDriver->pwm_autoscale(true);
++        Serial.printf("Left driver: conn=%d microsteps=%d rms: %d \n",
++                      leftDriver->test_connection(), leftDriver->microsteps(), leftDriver->rms_current());
++
++        rightDriver = new TMC2209Stepper(tmcSerial, 0.11, RIGHT_UART_ADDR);
++        rightDriver->begin();
++        rightDriver->toff(5);
++        rightDriver->rms_current(707);
++        rightDriver->microsteps(8);
++        rightDriver->pwm_autoscale(true);
++        Serial.printf("Right driver: conn=%d microsteps=%d rms: %d \n",
++                      rightDriver->test_connection(), rightDriver->microsteps(), rightDriver->rms_current());
++    } else {
++        // Step/dir-only drivers: microstepping comes from the jumpers, current from Vref.
++        Serial.println("No driver UART on this board: using jumper-set microstepping");
++    }
+ 
+     // enable all motors
+     pinMode(MOTOR_ENABLE_PIN, OUTPUT);
+@@ -39,11 +44,12 @@ Movement::Movement(Display *display)
+ 
+     leftMotor = new AccelStepper(AccelStepper::DRIVER, LEFT_STEP_PIN, LEFT_DIR_PIN);
+     leftMotor->setMaxSpeed(moveSpeedSteps);
+-    leftMotor->setPinsInverted(true);
++    leftMotor->setPinsInverted(BOARD_INVERT_LEFT);
+     leftMotor->disableOutputs();
+ 
+     rightMotor = new AccelStepper(AccelStepper::DRIVER, RIGHT_STEP_PIN, RIGHT_DIR_PIN);
+     rightMotor->setMaxSpeed(moveSpeedSteps);
++    rightMotor->setPinsInverted(BOARD_INVERT_RIGHT);
+     rightMotor->disableOutputs();
+ 
+     topDistance = -1;
+diff --git a/src/movement.h b/src/movement.h
+index 8e6f9b3..8dcc27d 100644
+--- a/src/movement.h
++++ b/src/movement.h
+@@ -6,6 +6,7 @@
+ #include "display.h"
+ #include "TMCStepper.h"
+ #include "Preferences.h"
++#include "board.h"
+ 
+ // Motor driver parameters.
+ constexpr int printSpeedSteps = 650;
+@@ -40,17 +41,17 @@ constexpr double safeXFraction = 0.2;           // Left and right margin: from d
+ // Variables used for debugging:
+ // constexpr int sleepDurationAfterMove_ms = 0;    // Delay after linear movement [ms], e.g. 50.
+ 
+-constexpr int LEFT_STEP_PIN = 14;
+-constexpr int LEFT_DIR_PIN = 12;
++constexpr int LEFT_STEP_PIN = BOARD_LEFT_STEP_PIN;
++constexpr int LEFT_DIR_PIN = BOARD_LEFT_DIR_PIN;
+ constexpr int LEFT_UART_ADDR = 0;
+ constexpr int LEFT_DIAG_PIN = 36;
+ 
+-constexpr int RIGHT_STEP_PIN = 25;
+-constexpr int RIGHT_DIR_PIN = 26;
++constexpr int RIGHT_STEP_PIN = BOARD_RIGHT_STEP_PIN;
++constexpr int RIGHT_DIR_PIN = BOARD_RIGHT_DIR_PIN;
+ constexpr int RIGHT_UART_ADDR = 1;
+ constexpr int RIGHT_DIAG_PIN = 39;
+ 
+-constexpr int MOTOR_ENABLE_PIN = 13;
++constexpr int MOTOR_ENABLE_PIN = BOARD_MOTOR_ENABLE_PIN;
+ 
+ class Movement{
+ private:
+diff --git a/src/pen.cpp b/src/pen.cpp
+index 6910134..c41ae15 100644
+--- a/src/pen.cpp
++++ b/src/pen.cpp
+@@ -1,4 +1,5 @@
+ #include "pen.h"
++#include "board.h"
+ 
+ bool shouldStop(int currentDegree, int targetDegree, bool positive) {
+     if (positive) {
+@@ -46,7 +47,7 @@ void doSlowMove(Pen* pen, int startDegree, int targetDegree, int speedDegPerSec)
+ Pen::Pen()
+ {
+     servo = new Servo();
+-    servo->attach(21);
++    servo->attach(BOARD_SERVO_PIN);
+     servo->write(70);
+     currentPosition = 70;
+ }

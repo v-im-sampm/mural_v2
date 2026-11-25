@@ -1,4 +1,2 @@
-host/www/
-host/.upstream/
+mural-firmware/
 __pycache__/
-*.pyc
